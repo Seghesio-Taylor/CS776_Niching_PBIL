@@ -1,4 +1,3 @@
-"""Simple population‑based incremental learning implementation."""
 import numpy as np
 import benchmarks as bm
 import os
@@ -11,12 +10,8 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Any
 
-# ---- Known peak / optimum positions ----
 
-# For F1 and F2 in [0,1], Deb & Goldberg peaks are approximately here:
 PEAK_POS_1D = np.array([0.1, 0.3, 0.5, 0.7, 0.9], dtype=float)
-
-# For Himmelblau (F3), these are the 4 known global minima.
 HIMMELBLAU_MINIMA = np.array([
     [ 3.0,       2.0      ],
     [-2.805118,  3.131312 ],
@@ -26,13 +21,6 @@ HIMMELBLAU_MINIMA = np.array([
 
 
 class PBIL:
-    """Population‑based incremental learner.
-
-    Uses a single probability vector to model binary chromosomes, updating
-    it towards the best sampled individual each generation.  Optional
-    mutation perturbs entries back towards 0.5 to maintain diversity.
-    """
-
     def __init__(
         self,
         func_id: str,
@@ -50,9 +38,7 @@ class PBIL:
         self.pmutate_prob = pmutate_prob
         self.mutation_shift = mutation_shift
         self.rng = rng if rng is not None else np.random.default_rng()
-        # Probability vector initialised to 0.5 (uniform ignorance)
         self.p = np.full(30, 0.5, dtype=float)
-        # Determine decoding and fitness functions
         if self.func_id in ('F1', 'F2'):
             self.decode = bm.bits_to_real_1d
         elif self.func_id == 'F3':
@@ -62,69 +48,46 @@ class PBIL:
         self.func = bm.get_function(func_id)
 
     def _sample_population(self) -> np.ndarray:
-        """Return ``num_samples`` binary chromosomes drawn from ``p``."""
-        return (self.rng.random((self.num_samples, 30)) < self.p).astype(np.int8)
+        rand = self.rng.random((self.num_samples, 30))
+        return (rand < self.p).astype(np.int8)
 
     def _evaluate_population(self, population: np.ndarray) -> np.ndarray:
-        """Return an array of fitness values for the sampled population."""
         fitness = np.empty(self.num_samples, dtype=float)
-        if self.func_id in ("F1", "F2"):
+        if self.func_id in ('F1', 'F2'):
             for i, bits in enumerate(population):
-                fitness[i] = self.func(self.decode(bits))
-        else:
+                x = self.decode(bits)
+                fitness[i] = self.func(x)
+        else:  # F3
             for i, bits in enumerate(population):
                 x1, x2 = self.decode(bits)
                 fitness[i] = self.func(x1, x2)
         return fitness
 
     def _mutate_probability_vector(self) -> None:
-        """Randomly perturb the probability vector towards 0.5."""
         mask = self.rng.random(self.p.shape) < self.pmutate_prob
         self.p[mask] = (1.0 - self.mutation_shift) * self.p[mask] + self.mutation_shift * 0.5
 
     def run(self) -> Dict[str, Any]:
-        """Execute the PBIL optimizer and return its history and final result.
-
-        Returns
-        -------
-        dict
-            Contains keys:
-            - 'best_fitness_per_gen': list of best fitness values per generation
-            - 'best_x_per_gen': list of best decoded phenotypes per generation
-            - 'final_p': final probability vector (np.ndarray of shape (30,))
-            - 'final_sample_bits': one sampled bitstring from final p
-            - 'final_sample_decoded': decoded phenotype of final sample
-            - 'final_fitness': fitness of final sample
-        """
-        # Determine number of generations based on total evaluations
         n_generations = max(1, self.total_evals // self.num_samples)
         best_fitness_per_gen: List[float] = []
         best_x_per_gen: List[Any] = []
         for _ in range(n_generations):
-            # Sample population
             pop = self._sample_population()
-            # Evaluate
             fitness = self._evaluate_population(pop)
-            # Identify best individual
             idx_best = int(np.argmax(fitness))
             best_bits = pop[idx_best]
-            # Decode best
             best_decoded = self.decode(best_bits)
             best_fit = fitness[idx_best]
             best_fitness_per_gen.append(float(best_fit))
             best_x_per_gen.append(best_decoded)
-            # Update probability vector toward best bits
-            # p_j = (1 - alpha) * p_j + alpha * s_j (s_j is 0 or 1)
             self.p = (1.0 - self.alpha) * self.p + self.alpha * best_bits
-            # Apply mutation to probability vector
             self._mutate_probability_vector()
-        # Generate a final sample and decode it
         final_sample_bits = (self.rng.random(30) < self.p).astype(np.int8)
         final_decoded = self.decode(final_sample_bits)
         if self.func_id in ('F1', 'F2'):
             final_fit = self.func(final_decoded)
         else:
-            final_fit = self.func(*final_decoded)  # type: ignore[arg-type]
+            final_fit = self.func(*final_decoded)
         return {
             'best_fitness_per_gen': best_fitness_per_gen,
             'best_x_per_gen': best_x_per_gen,
@@ -133,7 +96,6 @@ class PBIL:
             'final_sample_decoded': final_decoded,
             'final_fitness': float(final_fit),
         }
-
 
 def run_pbil(
     func_id: str,
@@ -145,7 +107,7 @@ def run_pbil(
     mutation_shift: float = 0.05,
     seed: int | None = None,
 ) -> List[Dict[str, Any]]:
-    """Return a list of PBIL run dictionaries across ``num_runs`` experiments."""
+
     results: List[Dict[str, Any]] = []
     for i in range(num_runs):
         rng = np.random.default_rng(None if seed is None else seed + i)
@@ -162,14 +124,10 @@ def run_pbil(
     return results
 
 def prepare_run_directory(model_name: str, func_id: str) -> Path:
-    """Create and return a fresh ``run_n`` directory for a given model/function."""
     base = Path(f"run_{model_name}")
     base.mkdir(exist_ok=True)
-
     func_dir = base / func_id
     func_dir.mkdir(exist_ok=True)
-
-    # Determine next run number
     existing = [d for d in func_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
     if not existing:
         next_run = 1
@@ -186,11 +144,7 @@ def prepare_run_directory(model_name: str, func_id: str) -> Path:
 
     return run_dir
 
-
-# ---------- Plotting helpers ----------
-
 def pbil_plot_spaghetti_best_fitness(results, func_id: str, out_path: Path) -> None:
-    """Spaghetti plot of best fitness per generation across PBIL runs."""
     plt.figure()
     for res in results:
         y = res["best_fitness_per_gen"]
@@ -206,7 +160,6 @@ def pbil_plot_spaghetti_best_fitness(results, func_id: str, out_path: Path) -> N
 
 
 def pbil_plot_1d_function_with_points(results, func_id: str, out_path: Path) -> None:
-    """Plot F1/F2 and overlay final PBIL solutions."""
     if func_id.upper() == "F1":
         f = bm.f1
     elif func_id.upper() == "F2":
@@ -236,7 +189,6 @@ def pbil_plot_1d_function_with_points(results, func_id: str, out_path: Path) -> 
 
 
 def pbil_plot_himmelblau_with_points(results, out_path: Path) -> None:
-    """Contour of Himmelblau + final PBIL solutions."""
     x = np.linspace(-6, 6, 200)
     y = np.linspace(-6, 6, 200)
     X, Y = np.meshgrid(x, y)
@@ -265,11 +217,7 @@ def pbil_plot_himmelblau_with_points(results, out_path: Path) -> None:
     plt.savefig(out_path)
     plt.close()
 
-
-# ---------- Saving CSV / JSON ----------
-
 def save_pbil_results_to_files(results, func_id: str, run_dir: Path) -> None:
-    """Save per-run PBIL curves and summaries."""
     for i, res in enumerate(results):
         idx = i + 1
 
@@ -292,24 +240,13 @@ def save_pbil_results_to_files(results, func_id: str, run_dir: Path) -> None:
         with json_path.open("w") as f:
             json.dump(summary, f, indent=2)
 
-# ----------------- PBIL peak analysis helpers -----------------
-
-
 def _assign_peak_1d(x: float, threshold: float = 0.1) -> int | None:
-    """
-    Assign a 1D point x in [0,1] to the nearest F1/F2 peak index,
-    or return None if it is farther than `threshold`.
-    """
     diffs = np.abs(PEAK_POS_1D - x)
     idx = int(np.argmin(diffs))
     return idx if diffs[idx] < threshold else None
 
 
 def _assign_peak_2d(x1: float, x2: float, threshold: float = 1.0) -> int | None:
-    """
-    Assign a 2D point (x1,x2) to the nearest Himmelblau minimum,
-    or return None if it is farther than `threshold`.
-    """
     point = np.array([x1, x2])
     diffs = np.linalg.norm(HIMMELBLAU_MINIMA - point, axis=1)
     idx = int(np.argmin(diffs))
@@ -317,16 +254,12 @@ def _assign_peak_2d(x1: float, x2: float, threshold: float = 1.0) -> int | None:
 
 
 def _pbil_collect_all_points(results, func_id: str):
-    """Collect final PBIL phenotypes across runs."""
     if func_id in ("F1", "F2"):
         return [float(res["final_sample_decoded"]) for res in results]
     else:
         return [tuple(res["final_sample_decoded"]) for res in results]
 
 def pbil_plot_peak_representatives(results, func_id: str, out_path: Path) -> None:
-    """
-    For vanilla PBIL: best final solution per peak (aggregated over runs).
-    """
     func_id = func_id.upper()
     pts = _pbil_collect_all_points(results, func_id)
 
@@ -405,9 +338,6 @@ def pbil_plot_peak_representatives(results, func_id: str, out_path: Path) -> Non
         plt.close()
 
 def pbil_plot_peak_occupancy(results, func_id: str, out_path: Path) -> None:
-    """
-    For vanilla PBIL: bar plot of how many runs converged to each peak.
-    """
     func_id = func_id.upper()
     pts = _pbil_collect_all_points(results, func_id)
 
@@ -438,9 +368,6 @@ def pbil_plot_peak_occupancy(results, func_id: str, out_path: Path) -> None:
     plt.close()
 
 def _pbil_best_run_index(results):
-    """
-    Choose best PBIL run by final_fitness.
-    """
     best_idx = 0
     best_val = -np.inf
     for i, res in enumerate(results):
@@ -452,9 +379,6 @@ def _pbil_best_run_index(results):
 
 
 def pbil_plot_single_run_final(results, func_id: str, out_path: Path) -> None:
-    """
-    Plot final PBIL solution from the single best run.
-    """
     func_id = func_id.upper()
     idx = _pbil_best_run_index(results)
     res = results[idx]
@@ -509,8 +433,6 @@ def pbil_plot_single_run_final(results, func_id: str, out_path: Path) -> None:
         plt.close()
 
 
-# ---------- Main entry point ----------
-
 def main():
     parser = argparse.ArgumentParser(description="Vanilla PBIL on Deb & Goldberg benchmarks")
     parser.add_argument("--func", type=str, default="F1", choices=["F1", "F2", "F3"], help="Benchmark function")
@@ -538,14 +460,11 @@ def main():
     )
 
     save_pbil_results_to_files(results, func_id, run_dir)
-
-    # visuals
     pbil_plot_spaghetti_best_fitness(results, func_id, run_dir / "best_fitness_spaghetti.png")
     pbil_plot_peak_representatives(results, func_id, run_dir / "pbil_peak_representatives.png")
     pbil_plot_peak_occupancy(results, func_id, run_dir / "pbil_peak_occupancy.png")
     pbil_plot_single_run_final(results, func_id, run_dir / "pbil_best_run_final_points.png")
 
-    # Function + final points
     if func_id in ("F1", "F2"):
         pbil_plot_1d_function_with_points(results, func_id, run_dir / f"{func_id.lower()}_final_points.png")
     else:
