@@ -1,36 +1,19 @@
-"""Island-based PBIL variants.
-
-This module defines basic and niching versions of a PBIL algorithm that
-maintain separate probability vectors for several islands.  Each island
-updates its own probability vector towards the best sampled individual.
-An optional niching mechanism periodically groups islands by phenotype and
-reinitialises or clones probability vectors to spread coverage across
-peaks.  In addition, the island updates are now parallelised using the
-`multiprocessing` module with the `fork` start method when multiple islands
-are configured.
-"""
 import numpy as np
 import benchmarks as bm
+import os
 import json
 import csv
 import matplotlib
-
-# Disable interactive backends for plotting
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import multiprocessing as mp
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
-# Use multiprocessing to parallelise island updates when num_islands > 1
-import multiprocessing
 
-# ---- Known peak / optimum positions ----
-
-# For F1 and F2 in [0,1], Deb & Goldberg peaks are approximately here:
 PEAK_POS_1D = np.array([0.1, 0.3, 0.5, 0.7, 0.9], dtype=float)
-
-# For Himmelblau (F3), these are the 4 known global minima.
 HIMMELBLAU_MINIMA = np.array([
     [ 3.0,       2.0      ],
     [-2.805118,  3.131312 ],
@@ -38,35 +21,97 @@ HIMMELBLAU_MINIMA = np.array([
     [ 3.584428, -1.848126 ],
 ], dtype=float)
 
+_MAX_INT_15 = (1 << 15) - 1
+_MAX_INT_30 = (1 << 30) - 1
+
+def real_to_bits_2d(x1: float, x2: float) -> np.ndarray:
+    x1 = float(np.clip(x1, -6.0, 6.0))
+    x2 = float(np.clip(x2, -6.0, 6.0))
+    b1 = int(round((x1 + 6.0) / 12.0 * _MAX_INT_15))
+    b2 = int(round((x2 + 6.0) / 12.0 * _MAX_INT_15))
+    bits = np.zeros(30, dtype=np.int8)
+    for i in range(14, -1, -1):
+        bits[i] = b1 & 1
+        b1 >>= 1
+    for i in range(29, 14, -1):
+        bits[i] = b2 & 1
+        b2 >>= 1
+    return bits
+
+def expected_real_from_p_1d(p_vec: np.ndarray) -> float:
+    p = np.clip(np.asarray(p_vec, dtype=float), 0.0, 1.0)
+    weights = (1 << np.arange(29, -1, -1)).astype(float)  # MSB first
+    e = float(np.dot(p, weights))  # expected integer value
+    return e / _MAX_INT_30
+
+def expected_real_from_p_2d(p_vec: np.ndarray) -> tuple[float, float]:
+    p = np.clip(np.asarray(p_vec, dtype=float), 0.0, 1.0)
+    p1 = p[:15]
+    p2 = p[15:]
+    weights = (1 << np.arange(14, -1, -1)).astype(float)  # MSB first
+    e1 = float(np.dot(p1, weights))
+    e2 = float(np.dot(p2, weights))
+    x1 = (e1 / _MAX_INT_15) * 12.0 - 6.0
+    x2 = (e2 / _MAX_INT_15) * 12.0 - 6.0
+    return x1, x2
+
+def _pbil_update_worker(args):
+    (
+        func_id,
+        p_vec,
+        num_samples,
+        alpha,
+        pmutate_prob,
+        mutation_shift,
+        seed,
+    ) = args
+
+    rng = np.random.default_rng(int(seed))
+    p_vec = np.asarray(p_vec, dtype=float).copy()
+
+    pop = (rng.random((num_samples, 30)) < p_vec).astype(np.int8)
+    fitness = np.empty(num_samples, dtype=float)
+
+    if func_id in ("F1", "F2"):
+        f = bm.get_function(func_id)
+        for i, bits in enumerate(pop):
+            x = bm.bits_to_real_1d(bits)
+            fitness[i] = f(x)
+    else:
+        f = bm.get_function("F3")
+        for i, bits in enumerate(pop):
+            x1, x2 = bm.bits_to_real_2d(bits)
+            fitness[i] = f(x1, x2)
+
+    idx_best = int(np.argmax(fitness))
+    best_bits = pop[idx_best]
+    best_fit = float(fitness[idx_best])
+
+    if func_id in ("F1", "F2"):
+        best_decoded = float(bm.bits_to_real_1d(best_bits))
+    else:
+        best_decoded = tuple(bm.bits_to_real_2d(best_bits))
+
+    p_vec = (1.0 - alpha) * p_vec + alpha * best_bits
+    mask = rng.random(p_vec.shape) < pmutate_prob
+    p_vec[mask] = (1.0 - mutation_shift) * p_vec[mask] + mutation_shift * 0.5
+
+    return p_vec, best_fit, best_decoded
 
 class IslandPBILBase:
-    """Baseline island PBIL optimiser.
-
-    Maintains one probability vector per island and updates each of them
-    independently towards the best sampled individual.  For efficiency
-    the island updates are performed in parallel using `multiprocessing`
-    when more than one island is present.  Subclasses may override the
-    ``after_generation`` hook to implement niching or other coordination.
-    """
-
     def __init__(
-        self,
-        func_id: str,
-        num_islands: int = 5,
-        total_evals: int = 20000,
-        num_samples: int = 50,
-        alpha: float = 0.1,
-        pmutate_prob: float = 0.02,
-        mutation_shift: float = 0.05,
-        rng: Optional[np.random.Generator] = None,
-    ) -> None:
-        """Initialise the baseline island PBIL.
-
-        Arguments correspond to the benchmark identifier, number of islands,
-        total function evaluations, samples per island per generation, and
-        learning and mutation rates.  A custom ``rng`` can be supplied for
-        reproducibility; otherwise ``default_rng`` is used.
-        """
+            self,
+            func_id: str,
+            num_islands: int = 5,
+            total_evals: int = 20000,
+            num_samples: int = 50,
+            alpha: float = 0.1,
+            pmutate_prob: float = 0.02,
+            mutation_shift: float = 0.05,
+            rng: np.random.Generator | None = None,
+            use_mp: bool = False,
+            mp_workers: int | None = None,
+        ) -> None:
         self.func_id = func_id.upper()
         self.num_islands = num_islands
         self.total_evals = total_evals
@@ -75,33 +120,34 @@ class IslandPBILBase:
         self.pmutate_prob = pmutate_prob
         self.mutation_shift = mutation_shift
         self.rng = rng if rng is not None else np.random.default_rng()
-        # Per‑island probability vectors (initially all 0.5)
+        self.use_mp = bool(use_mp)
+        self.mp_workers = mp_workers
         self.p = np.full((num_islands, 30), 0.5, dtype=float)
-        # Determine decoding and objective functions
-        if self.func_id in ("F1", "F2"):
+        self.p += (self.rng.random(self.p.shape) - 0.5) * 0.02
+        self.p = np.clip(self.p, 0.0, 1.0)
+        if self.func_id in ('F1', 'F2'):
             self.decode = bm.bits_to_real_1d
-        elif self.func_id == "F3":
+        elif self.func_id == 'F3':
             self.decode = bm.bits_to_real_2d
         else:
             raise ValueError(f"Unknown function id: {func_id}")
         self.func = bm.get_function(func_id)
-        # Number of generations = total_evals / (num_islands * num_samples)
         denom = max(1, self.num_islands * self.num_samples)
         self.n_generations = max(1, self.total_evals // denom)
-        # Logs: one list per island
         self.best_fitness_per_gen: List[List[float]] = [list() for _ in range(num_islands)]
         self.best_x_per_gen: List[List[Any]] = [list() for _ in range(num_islands)]
+        self.trace_x_per_gen: List[List[Any]] = [list() for _ in range(num_islands)]
 
     def _sample_population(self, island_idx: int) -> np.ndarray:
-        """Return a sample of ``num_samples`` bitstrings for an island."""
-        return (self.rng.random((self.num_samples, 30)) < self.p[island_idx]).astype(np.int8)
+        rand = self.rng.random((self.num_samples, 30))
+        return (rand < self.p[island_idx]).astype(np.int8)
 
     def _evaluate_population(self, population: np.ndarray) -> np.ndarray:
-        """Evaluate a population and return an array of fitnesses."""
         fitness = np.empty(self.num_samples, dtype=float)
-        if self.func_id in ("F1", "F2"):
+        if self.func_id in ('F1', 'F2'):
             for i, bits in enumerate(population):
-                fitness[i] = self.func(self.decode(bits))
+                x = self.decode(bits)
+                fitness[i] = self.func(x)
         else:
             for i, bits in enumerate(population):
                 x1, x2 = self.decode(bits)
@@ -109,167 +155,379 @@ class IslandPBILBase:
         return fitness
 
     def _update_island(self, island_idx: int) -> Tuple[float, Any]:
-        """Update a single island and record its best fitness and phenotype."""
         pop = self._sample_population(island_idx)
         fitness = self._evaluate_population(pop)
         idx_best = int(np.argmax(fitness))
         best_bits = pop[idx_best]
         best_fit = float(fitness[idx_best])
         best_decoded = self.decode(best_bits)
-        # Update probability vector
         self.p[island_idx] = (1.0 - self.alpha) * self.p[island_idx] + self.alpha * best_bits
-        # Mutation
         mask = self.rng.random(self.p[island_idx].shape) < self.pmutate_prob
-        self.p[island_idx][mask] = (1.0 - self.mutation_shift) * self.p[island_idx][mask] + self.mutation_shift * 0.5
+        self.p[island_idx][mask] = (
+            (1.0 - self.mutation_shift) * self.p[island_idx][mask]
+            + self.mutation_shift * 0.5
+        )
         # Log
         self.best_fitness_per_gen[island_idx].append(best_fit)
         self.best_x_per_gen[island_idx].append(best_decoded)
+        if self.func_id in ("F1", "F2"):
+            self.trace_x_per_gen[island_idx].append(expected_real_from_p_1d(self.p[island_idx]))
+        else:
+            self.trace_x_per_gen[island_idx].append(expected_real_from_p_2d(self.p[island_idx]))
+
+
         return best_fit, best_decoded
 
+    def _initialise_island_to_peak(self, island_idx: int, peak_index: int) -> None:
+        n_bits = self.p.shape[1]
+        if self.func_id in ("F1", "F2"):
+            target_x = float(PEAK_POS_1D[peak_index])
+
+            def _dist(bits: np.ndarray) -> float:
+                x = float(self.decode(bits))
+                return abs(x - target_x)
+        else:
+            target_point = np.array(HIMMELBLAU_MINIMA[peak_index], dtype=float)
+
+            def _dist(bits: np.ndarray) -> float:
+                x1, x2 = self.decode(bits)
+                v = np.array([float(x1), float(x2)], dtype=float) - target_point
+                return float(np.linalg.norm(v))
+
+        best_bits: Optional[np.ndarray] = None
+        best_dist = float("inf")
+
+        for _ in range(256):
+            bits = (self.rng.random(n_bits) < 0.5).astype(np.int8)
+            d = _dist(bits)
+            if d < best_dist:
+                best_bits, best_dist = bits, d
+
+        if best_bits is None:
+            self._reinitialize_island(island_idx)
+            return
+
+        probs = 0.001 + 0.998 * best_bits.astype(float)
+        self.p[island_idx] = probs
+
+
     def after_generation(self, gen: int) -> None:
-        """Hook for subclasses; called after each generation."""
         pass
 
     def run(self) -> Dict[str, Any]:
-        """Execute the island PBIL for the configured number of generations.
+            pool = None
+            if self.use_mp:
+                try:
+                    ctx = mp.get_context("fork")
+                except ValueError:
+                    ctx = mp.get_context()
+                pool = ctx.Pool(processes=self.mp_workers)
 
-        When more than one island is present the per‑generation updates
-        are dispatched concurrently using the ``multiprocessing`` module
-        with the ``fork`` start method.  At the end of the run one
-        individual is sampled from each island's probability vector.
-        """
-        ctx: Optional[multiprocessing.context.BaseContext] = None
-        if self.num_islands > 1:
-            ctx = multiprocessing.get_context("fork")
-        for gen in range(self.n_generations):
-            if self.num_islands > 1 and ctx is not None:
-                args_list: List[Tuple[np.ndarray, str, int, float, float, float, int]] = []
+            try:
                 for k in range(self.num_islands):
-                    seed = int(self.rng.integers(0, 2**32))
-                    args_list.append((self.p[k].copy(), self.func_id, self.num_samples,
-                                      self.alpha, self.pmutate_prob, self.mutation_shift, seed))
-                with ctx.Pool(self.num_islands) as pool:
-                    results = pool.map(_island_worker, args_list)
-                for k, (new_p, best_fit, best_decoded) in enumerate(results):
-                    self.p[k] = new_p
-                    self.best_fitness_per_gen[k].append(best_fit)
-                    self.best_x_per_gen[k].append(best_decoded)
-            else:
+                    if self.func_id in ("F1", "F2"):
+                        self.trace_x_per_gen[k].append(expected_real_from_p_1d(self.p[k]))
+                    else:
+                        self.trace_x_per_gen[k].append(expected_real_from_p_2d(self.p[k]))
+
+                for gen in range(self.n_generations):
+                    if pool is None:
+                        for k in range(self.num_islands):
+                            self._update_island(k)
+                    else:
+                        seeds = self.rng.integers(0, 2**32 - 1, size=self.num_islands, dtype=np.uint32)
+                        args = [
+                            (
+                                self.func_id,
+                                self.p[k],
+                                self.num_samples,
+                                self.alpha,
+                                self.pmutate_prob,
+                                self.mutation_shift,
+                                int(seeds[k]),
+                            )
+                            for k in range(self.num_islands)
+                        ]
+                        results = pool.map(_pbil_update_worker, args)
+                        for k, (p_vec, best_fit, best_decoded) in enumerate(results):
+                            self.p[k] = p_vec
+                            self.best_fitness_per_gen[k].append(float(best_fit))
+                            self.best_x_per_gen[k].append(best_decoded)
+                            if self.func_id in ("F1", "F2"):
+                                self.trace_x_per_gen[k].append(expected_real_from_p_1d(self.p[k]))
+                            else:
+                                self.trace_x_per_gen[k].append(expected_real_from_p_2d(self.p[k]))
+
+                    self.after_generation(gen)
+
+                final_decoded: List[Any] = []
+                final_fitness: List[float] = []
                 for k in range(self.num_islands):
-                    self._update_island(k)
-            self.after_generation(gen)
-        final_decoded: List[Any] = []
-        final_fitness: List[float] = []
-        for k in range(self.num_islands):
-            bits = (self.rng.random(30) < self.p[k]).astype(np.int8)
-            decoded = self.decode(bits)
-            if self.func_id in ("F1", "F2"):
-                fit = self.func(decoded)
-            else:
-                fit = self.func(*decoded)  # type: ignore[arg-type]
-            final_decoded.append(decoded)
-            final_fitness.append(float(fit))
-        return {
-            "best_fitness_per_gen": self.best_fitness_per_gen,
-            "best_x_per_gen": self.best_x_per_gen,
-            "final_p": self.p.copy(),
-            "final_sample_decoded": final_decoded,
-            "final_fitness": final_fitness,
-        }
+                    bits = (self.rng.random(30) < self.p[k]).astype(np.int8)
+                    decoded = self.decode(bits)
+                    if self.func_id in ("F1", "F2"):
+                        fit = self.func(decoded)
+                    else:
+                        fit = self.func(*decoded)
+                    final_decoded.append(decoded)
+                    final_fitness.append(float(fit))
 
-# Helper for multiprocessing: perform one PBIL generation for a single island.
-# The function is defined at module scope so that it can be pickled by
-# multiprocessing.  It takes a copy of the island's probability vector and
-# algorithm parameters, runs one generation of sampling, evaluation and
-# update, and returns the updated probability vector along with the best
-# fitness and decoded phenotype.
-def _island_worker(args: Tuple[np.ndarray, str, int, float, float, float, int]) -> Tuple[np.ndarray, float, Any]:
-    """Worker function for a single island PBIL generation.
+                return {
+                    "best_fitness_per_gen": self.best_fitness_per_gen,
+                    "best_x_per_gen": self.best_x_per_gen,
+                    "final_p": self.p.copy(),
+                    "final_sample_decoded": final_decoded,
+                    "final_fitness": final_fitness,
+                    "trace_x_per_gen": self.trace_x_per_gen,
+                }
+            finally:
+                if pool is not None:
+                    pool.close()
+                    pool.join()
 
-    Takes a copy of the island's probability vector and algorithm
-    parameters, samples a population, evaluates it, updates the vector
-    towards the best individual, applies mutation, and returns the
-    updated vector along with the best fitness and decoded phenotype.
-    """
-    p_row, func_id, num_samples, alpha, pmutate_prob, mutation_shift, seed = args
-    rng = np.random.default_rng(seed)
-    # Decode and objective functions
-    if func_id in ("F1", "F2"):
-        decode = bm.bits_to_real_1d
-    else:
-        decode = bm.bits_to_real_2d
-    func = bm.get_function(func_id)
-    rand = rng.random((num_samples, 30))
-    pop = (rand < p_row).astype(np.int8)
-    fitness = np.empty(num_samples, dtype=float)
-    if func_id in ("F1", "F2"):
-        for i, bits in enumerate(pop):
-            fitness[i] = func(decode(bits))
-    else:
-        for i, bits in enumerate(pop):
-            x1, x2 = decode(bits)
-            fitness[i] = func(x1, x2)
-    idx_best = int(np.argmax(fitness))
-    best_bits = pop[idx_best]
-    best_fit = float(fitness[idx_best])
-    best_decoded = decode(best_bits)
-    new_p = (1.0 - alpha) * p_row + alpha * best_bits
-    mask = rng.random(new_p.shape) < pmutate_prob
-    new_p[mask] = (1.0 - mutation_shift) * new_p[mask] + mutation_shift * 0.5
-    return new_p, best_fit, best_decoded
 
 
 class IslandPBILNiching(IslandPBILBase):
-    """Island PBIL with optional niching.
-
-    Inherits the baseline PBIL and adds periodic niche detection.  In
-    ``base`` mode, excess islands in a niche are reset to explore other
-    regions; in ``proportional`` mode, the number of islands per niche is
-    adjusted according to niche fitnesses.
-    """
-
     def __init__(
-        self,
-        func_id: str,
-        num_islands: int = 5,
-        total_evals: int = 20000,
-        num_samples: int = 50,
-        alpha: float = 0.1,
-        pmutate_prob: float = 0.02,
-        mutation_shift: float = 0.05,
-        mode: str = 'base',
-        niching_interval: int = 10,
-        sigma_niche: float | None = None,
-        rng: Optional[np.random.Generator] = None,
-    ) -> None:
-        super().__init__(
-            func_id=func_id,
-            num_islands=num_islands,
-            total_evals=total_evals,
-            num_samples=num_samples,
-            alpha=alpha,
-            pmutate_prob=pmutate_prob,
-            mutation_shift=mutation_shift,
-            rng=rng,
+            self,
+            func_id: str,
+            mode: str = "base",
+            num_islands: int = 5,
+            total_evals: int = 20000,
+            num_samples: int = 50,
+            alpha: float = 0.1,
+            pmutate_prob: float = 0.02,
+            mutation_shift: float = 0.05,
+            niching_interval: int = 10,
+            sigma_niche: float = 0.1,
+            rng: np.random.Generator | None = None,
+            nudge: bool = True,
+            nudge_strength: float = 1.0,
+            use_mp: bool = False,
+            mp_workers: int | None = None,
+        ) -> None:
+            super().__init__(
+                func_id=func_id,
+                num_islands=num_islands,
+                total_evals=total_evals,
+                num_samples=num_samples,
+                alpha=alpha,
+                pmutate_prob=pmutate_prob,
+                mutation_shift=mutation_shift,
+                rng=rng,
+                use_mp=use_mp,
+                mp_workers=mp_workers,
+            )
+            self.mode = mode
+            self.niching_interval = niching_interval
+            self.sigma_niche = sigma_niche
+            self.nudge = bool(nudge)
+            self.nudge_strength = float(nudge_strength)
+            self.peak_goals: List[Optional[int]] = [None] * self.num_islands
+            self.peak_threshold = 0.8 if self.func_id == "F3" else 0.08
+            if self.func_id in ("F1", "F2"):
+                num_peaks = len(PEAK_POS_1D)
+            else:
+                num_peaks = len(HIMMELBLAU_MINIMA)
+            self.peak_owner: List[Optional[int]] = [None] * num_peaks
+            self.island_owner: List[Optional[int]] = [None] * self.num_islands
+            self.coverage_start_gen = 25
+            if self.mode == "peak_walk":
+                for i in range(min(self.num_islands, num_peaks)):
+                    self.peak_goals[i] = i
+
+    def _update_island(self, island_idx: int) -> Tuple[float, Any]:
+        pop = self._sample_population(island_idx)
+        fitness = self._evaluate_population(pop)
+        idx_best = int(np.argmax(fitness))
+        best_bits = pop[idx_best]
+        best_fit = float(fitness[idx_best])
+        best_decoded = self.decode(best_bits)
+        alpha_eff = self.alpha
+        pmutate_eff = self.pmutate_prob
+
+        if self.func_id == "F2" and self.mode == "peak_walk":
+            if (self.peak_goals[island_idx] is not None) or (self.island_owner[island_idx] is not None):
+                alpha_eff = 0.0
+                pmutate_eff = 0.0
+
+        if self.mode == "peak_walk" and self.peak_goals[island_idx] is not None:
+            g = self.peak_goals[island_idx]
+
+            if self.func_id in ("F1", "F2"):
+                cur = float(expected_real_from_p_1d(self.p[island_idx]))
+                tgt = float(PEAK_POS_1D[g])
+                dist = abs(cur - tgt)
+            else:
+                cur = np.array(expected_real_from_p_2d(self.p[island_idx]), dtype=float)
+                tgt = np.array(HIMMELBLAU_MINIMA[g], dtype=float)
+                dist = float(np.linalg.norm(cur - tgt))
+
+            if self.func_id == "F2":
+                freeze_dist = 0.5 * self.peak_threshold
+            else:
+                freeze_dist = 1.5
+
+            if dist > freeze_dist:
+                alpha_eff = 0.0
+                pmutate_eff = 0.0
+            else:
+                if self.func_id == "F2":
+                    alpha_eff = self.alpha
+                    pmutate_eff = self.pmutate_prob
+                else:
+                    alpha_eff = 0.10 * self.alpha
+                    pmutate_eff = self.pmutate_prob
+
+        self.p[island_idx] = (1.0 - alpha_eff) * self.p[island_idx] + alpha_eff * best_bits
+        mask = self.rng.random(self.p[island_idx].shape) < pmutate_eff
+        self.p[island_idx][mask] = (
+            (1.0 - self.mutation_shift) * self.p[island_idx][mask]
+            + self.mutation_shift * 0.5
         )
-        self.mode = mode.lower()
-        if sigma_niche is None:
-            # Default threshold: 0.1 for 1D, 1.0 for 2D (squared distance)
-            sigma_niche = 0.1 if func_id.upper() in ('F1', 'F2') else 1.0
-        self.sigma_niche = sigma_niche
-        self.niching_interval = niching_interval
+
+        # Log
+        self.best_fitness_per_gen[island_idx].append(best_fit)
+        self.best_x_per_gen[island_idx].append(best_decoded)
+        if self.func_id in ("F1", "F2"):
+            self.trace_x_per_gen[island_idx].append(expected_real_from_p_1d(self.p[island_idx]))
+        else:
+            self.trace_x_per_gen[island_idx].append(expected_real_from_p_2d(self.p[island_idx]))
+
+        return best_fit, best_decoded
+
+    def _peak_index(self, pheno: Any) -> Optional[int]:
+        if pheno is None:
+            return None
+        if self.func_id in ("F1", "F2"):
+            return _assign_peak_1d(float(pheno), threshold=self.peak_threshold)
+        x1, x2 = pheno
+        return _assign_peak_2d(float(x1), float(x2), threshold=self.peak_threshold)
+
+
+    def _nudge_island(self, island_idx: int, away_from: Any | None = None) -> None:
+        if not self.nudge:
+            self._reinitialize_island(island_idx)
+            return
+
+        if not self.best_x_per_gen[island_idx]:
+            self._reinitialize_island(island_idx)
+            return
+
+        last = self.best_x_per_gen[island_idx][-1]
+        if last is None:
+            self._reinitialize_island(island_idx)
+            return
+
+        if self.func_id in ("F1", "F2"):
+            x = float(last)
+            if away_from is None:
+                direction = -1.0 if x >= 0.5 else 1.0
+            else:
+                ref = float(away_from)
+                direction = 1.0 if x >= ref else -1.0
+            step = self.nudge_strength * float(self.sigma_niche)
+            x_new = float(np.clip(x + direction * step + self.rng.normal(0.0, 0.2 * step), 0.0, 1.0))
+            bits = bm.real_to_bits_1d(x_new)
+        else:
+            x1, x2 = last
+            p = np.array([float(x1), float(x2)], dtype=float)
+            if away_from is None:
+                v = self.rng.normal(0.0, 1.0, size=2)
+            else:
+                ref = np.array([float(away_from[0]), float(away_from[1])], dtype=float)
+                v = p - ref
+                if float(np.linalg.norm(v)) == 0.0:
+                    v = self.rng.normal(0.0, 1.0, size=2)
+            v = v / (np.linalg.norm(v) + 1e-12)
+            step = self.nudge_strength * float(np.sqrt(self.sigma_niche))
+            p_new = p + v * step + self.rng.normal(0.0, 0.1 * step, size=2)
+            p_new[0] = float(np.clip(p_new[0], -6.0, 6.0))
+            p_new[1] = float(np.clip(p_new[1], -6.0, 6.0))
+            bits = real_to_bits_2d(p_new[0], p_new[1])
+
+        target = 0.001 + 0.998 * bits.astype(float)
+        beta = 0.10
+        self.p[island_idx] = (1.0 - beta) * self.p[island_idx] + beta * target
+        self.p[island_idx] = np.clip(self.p[island_idx], 0.0, 1.0)
+
+    def _nudge_toward_peak(self, island_idx: int, peak_index: int) -> None:
+        if self.func_id in ("F1", "F2"):
+            target_x = float(PEAK_POS_1D[peak_index])
+
+            cur_x = float(expected_real_from_p_1d(self.p[island_idx]))
+            dist = abs(target_x - cur_x)
+            if dist < 1e-12:
+                return
+
+            direction = 1.0 if target_x >= cur_x else -1.0
+            step = self.nudge_strength * float(self.sigma_niche)
+            step = min(step, 0.75 * dist)
+            noise_scale = 0.01 if self.func_id == "F2" else 0.05
+            x_new = float(np.clip(cur_x + direction * step + self.rng.normal(0.0, noise_scale * step), 0.0, 1.0))
+            bits = bm.real_to_bits_1d(x_new)
+            target_p = 0.001 + 0.998 * bits.astype(float)
+            if self.func_id == "F2":
+                if dist > 0.4:
+                    beta = 0.40
+                elif dist > 0.2:
+                    beta = 0.25
+                elif dist > 0.1:
+                    beta = 0.15
+                elif dist > 0.05:
+                    beta = 0.10
+                else:
+                    beta = 0.06
+            else:
+                if dist > 0.4:
+                    beta = 0.35
+                elif dist > 0.2:
+                    beta = 0.20
+                elif dist > 0.1:
+                    beta = 0.10
+                else:
+                    beta = 0.04
+
+
+            self.p[island_idx] = np.clip((1.0 - beta) * self.p[island_idx] + beta * target_p, 0.0, 1.0)
+            return
+
+        target = np.array(HIMMELBLAU_MINIMA[peak_index], dtype=float)
+        cur = np.array(expected_real_from_p_2d(self.p[island_idx]), dtype=float)
+
+        v = target - cur
+        dist = float(np.linalg.norm(v))
+        if dist < 1e-12:
+            return
+        v = v / dist
+
+        base_step = self.nudge_strength * float(np.sqrt(self.sigma_niche))
+        step = min(base_step, 0.75 * dist)
+
+        p_new = cur + v * step + self.rng.normal(0.0, 0.05 * step, size=2)
+        p_new[0] = float(np.clip(p_new[0], -6.0, 6.0))
+        p_new[1] = float(np.clip(p_new[1], -6.0, 6.0))
+
+        bits = real_to_bits_2d(p_new[0], p_new[1])
+        target_p = 0.001 + 0.998 * bits.astype(float)
+
+        if dist > 4.0:
+            beta = 0.35
+        elif dist > 2.0:
+            beta = 0.20
+        elif dist > 1.0:
+            beta = 0.10
+        else:
+            beta = 0.04
+
+        self.p[island_idx] = np.clip((1.0 - beta) * self.p[island_idx] + beta * target_p, 0.0, 1.0)
+
 
     def _decode_best_per_island(self) -> Tuple[List[Any], List[float]]:
-        """Return current best decoded phenotype and fitness for each island.
-
-        Uses the last recorded generation's best values.
-        """
         decoded_list: List[Any] = []
         fitness_list: List[float] = []
         for k in range(self.num_islands):
-            # Use last logged best phenotype and fitness
             if not self.best_fitness_per_gen[k]:
-                # If no entry (e.g., before first generation), use neutral values
                 decoded_list.append(None)
                 fitness_list.append(float('-inf'))
                 continue
@@ -278,190 +536,305 @@ class IslandPBILNiching(IslandPBILBase):
         return decoded_list, fitness_list
 
     def _cluster_islands(self, decoded_list: List[Any], fitness_list: List[float]) -> Tuple[List[int], List[List[int]]]:
-        """Cluster islands into niches using greedy phenotypic distance clustering.
-
-        Parameters
-        ----------
-        decoded_list : list
-            Current decoded phenotype per island.
-        fitness_list : list
-            Current fitness per island.
-
-        Returns
-        -------
-        Tuple[List[int], List[List[int]]]
-            A tuple (representatives, niches) where:
-                representatives: list of representative island indices (one per niche)
-                niches: list of lists; each inner list contains indices of islands
-                    assigned to that niche.
-        """
-        # Sort islands by fitness descending; store indices
         idxs = list(range(self.num_islands))
-        # If fitness_list entries may contain -inf for empty logs, treat them as lowest
         sorted_islands = sorted(idxs, key=lambda i: fitness_list[i], reverse=True)
         representatives: List[int] = []
         niches: List[List[int]] = []
         for idx in sorted_islands:
-            # Skip islands with undefined decoded phenotype
             pheno = decoded_list[idx]
             if pheno is None:
                 continue
             if not representatives:
-                # First niche
                 representatives.append(idx)
                 niches.append([idx])
             else:
-                # Compute distances to existing representatives
                 dists = []
                 for rep in representatives:
                     rep_pheno = decoded_list[rep]
-                    # Cast to correct distance function based on dimensionality
                     if self.func_id in ('F1', 'F2'):
-                        d = bm.distance_1d(pheno, rep_pheno)  # type: ignore[arg-type]
+                        d = bm.distance_1d(pheno, rep_pheno)
                     else:
-                        d = bm.distance_2d(pheno, rep_pheno)  # type: ignore[arg-type]
+                        d = bm.distance_2d(pheno, rep_pheno)
                     dists.append(d)
-                # Determine if this island starts a new niche
                 min_dist = min(dists)
                 if min_dist > self.sigma_niche:
                     representatives.append(idx)
                     niches.append([idx])
                 else:
-                    # Assign to the nearest niche
                     nearest = int(np.argmin(dists))
                     niches[nearest].append(idx)
         return representatives, niches
 
     def _reinitialize_island(self, island_idx: int) -> None:
-        """Reinitialise a given island's probability vector.
-
-        The new probability vector is uniform (0.5 for all bits) plus small
-        random noise to break symmetry.
-        """
-        # Uniform 0.5 plus random noise in [-0.05, 0.05]
         noise = (self.rng.random(30) - 0.5) * 0.1
         new_p = 0.5 + noise
-        # Clamp to [0,1]
         new_p = np.clip(new_p, 0.0, 1.0)
         self.p[island_idx] = new_p
 
     def _clone_island(self, target_idx: int, source_idx: int) -> None:
-        """Clone the probability vector of a source island into a target island.
-
-        Adds small random noise to diversify the clone.
-        """
-        # Copy p vector from source
         new_p = self.p[source_idx].copy()
-        # Add small noise in [-0.05,0.05]
         noise = (self.rng.random(30) - 0.5) * 0.1
         new_p = new_p + noise
         new_p = np.clip(new_p, 0.0, 1.0)
         self.p[target_idx] = new_p
 
     def after_generation(self, gen: int) -> None:
-        # Only perform niching at specified intervals
-        if (gen + 1) % self.niching_interval != 0:
-            return
-        # Gather current best decoded phenotypes and fitness per island
+        if self.mode in ("peak_walk", "peak_repulsion"):
+            pass
+        else:
+            if (gen + 1) % self.niching_interval != 0:
+                return
+
         decoded_list, fitness_list = self._decode_best_per_island()
-        # If we have no valid decoded values, skip
         if all(pheno is None for pheno in decoded_list):
             return
-        # Cluster islands into niches
+
         representatives, niches = self._cluster_islands(decoded_list, fitness_list)
         if not niches:
             return
-        # Process based on mode
         if self.mode == 'base':
-            # In base mode, we aim for one island per niche when #islands == #peaks
-            # For each niche, keep the representative and reinitialize other members
             for rep, members in zip(representatives, niches):
-                # members includes rep; we keep rep and reset others
                 for idx in members:
                     if idx == rep:
                         continue
-                    self._reinitialize_island(idx)
+                    self._nudge_island(idx, away_from=decoded_list[rep])
+        elif self.mode == "peak_repulsion":
+            if self.func_id in ("F1", "F2"):
+                num_peaks = len(PEAK_POS_1D)
+
+                def assign_peak(pheno: Any) -> Optional[int]:
+                    if pheno is None:
+                        return None
+                    x = float(pheno)
+                    return _assign_peak_1d(x, threshold=self.sigma_niche)
+
+            else:
+                num_peaks = len(HIMMELBLAU_MINIMA)
+
+                def assign_peak(pheno: Any) -> Optional[int]:
+                    if pheno is None:
+                        return None
+                    x1, x2 = pheno
+                    return _assign_peak_2d(
+                        float(x1),
+                        float(x2),
+                        threshold=self.sigma_niche,
+                    )
+
+            peak_to_islands: List[List[int]] = [[] for _ in range(num_peaks)]
+            unassigned: List[int] = []
+
+            for idx, pheno in enumerate(decoded_list):
+                pk = assign_peak(pheno)
+                if pk is None:
+                    unassigned.append(idx)
+                else:
+                    peak_to_islands[pk].append(idx)
+
+            for pk_idx, members in enumerate(peak_to_islands):
+                if not members:
+                    continue
+                best_idx = max(members, key=lambda i: fitness_list[i])
+                for i in members:
+                    if i == best_idx:
+                        continue
+                    self._nudge_island(i, away_from=decoded_list[best_idx])
+                    unassigned.append(i)
+                peak_to_islands[pk_idx] = [best_idx]
+
+            for pk_idx in range(num_peaks):
+                if peak_to_islands[pk_idx]:
+                    continue  # already has an island
+                if not unassigned:
+                    break     # no spare islands left
+                idx = unassigned.pop()
+                self._initialise_island_to_peak(idx, pk_idx)
+                peak_to_islands[pk_idx].append(idx)
+
+        elif self.mode == "peak_walk":
+            if self.func_id in ("F1", "F2"):
+                num_peaks = len(PEAK_POS_1D)
+
+                def assign_peak(pheno: Any) -> Optional[int]:
+                    if pheno is None:
+                        return None
+                    return _assign_peak_1d(float(pheno), threshold=self.peak_threshold)
+            else:
+                num_peaks = len(HIMMELBLAU_MINIMA)
+
+                def assign_peak(pheno: Any) -> Optional[int]:
+                    if pheno is None:
+                        return None
+                    x1, x2 = pheno
+                    return _assign_peak_2d(float(x1), float(x2), threshold=self.peak_threshold)
+
+            cur_pos: List[Any] = []
+            for i in range(self.num_islands):
+                if self.trace_x_per_gen[i]:
+                    cur_pos.append(self.trace_x_per_gen[i][-1])
+                else:
+                    cur_pos.append(decoded_list[i])
+
+            if gen == 0:
+                for i in range(self.num_islands):
+                    self.peak_goals[i] = i if i < num_peaks else None
+
+            for i in range(self.num_islands):
+                owned = self.island_owner[i]
+                if owned is not None:
+                    self._nudge_toward_peak(i, owned)
+
+            for i in range(self.num_islands):
+                g = self.peak_goals[i]
+                if g is None:
+                    continue
+
+                pk = self._peak_index(cur_pos[i])
+                if pk == g:
+                    if self.peak_owner[g] is None:
+                        self.peak_owner[g] = i
+                        self.island_owner[i] = g
+                        self.peak_goals[i] = None
+                else:
+                    self._nudge_toward_peak(i, g)
+
+            peak_to_islands: List[List[int]] = [[] for _ in range(num_peaks)]
+            for i in range(self.num_islands):
+                pk = assign_peak(cur_pos[i])
+                if pk is None:
+                    continue
+                if self.func_id == "F2":
+                    g = self.peak_goals[i]
+                    if (self.island_owner[i] is None) and (g is not None) and (pk != g):
+                        continue
+
+                peak_to_islands[pk].append(i)
+
+            reserved_peaks: set[int] = {g for g in self.peak_goals if g is not None}
+            reserved_peaks |= {p for p, owner in enumerate(self.peak_owner) if owner is not None}
+
+            for pk in range(num_peaks):
+                members = peak_to_islands[pk]
+                if len(members) <= 1:
+                    continue
+
+                owner = self.peak_owner[pk]
+                if owner is not None and owner in members:
+                    keep = owner
+                else:
+                    keep = max(members, key=lambda i: fitness_list[i])
+                    if gen >= self.coverage_start_gen:
+                        self.peak_owner[pk] = keep
+                        self.island_owner[keep] = pk
+                        if self.peak_goals[keep] == pk:
+                            self.peak_goals[keep] = None
+
+                for i in members:
+                    if i == keep:
+                        continue
+                    if self.island_owner[i] == pk:
+                        self.island_owner[i] = None
+                    if self.peak_goals[i] == pk:
+                        self.peak_goals[i] = None
+
+                    available = [p for p in range(num_peaks)
+                                 if self.peak_owner[p] is None and p not in reserved_peaks]
+
+                    if available:
+                        if self.func_id == "F3":
+                            pcur = np.array(cur_pos[i], dtype=float)
+                            d = [np.linalg.norm(np.array(HIMMELBLAU_MINIMA[p]) - pcur) for p in available]
+                            tgt = available[int(np.argmin(d))]
+                        else:
+                            xcur = float(cur_pos[i])
+                            d = [abs(float(PEAK_POS_1D[p]) - xcur) for p in available]
+                            tgt = available[int(np.argmin(d))]
+
+                        self.peak_goals[i] = tgt
+                        reserved_peaks.add(tgt)
+                        self._nudge_toward_peak(i, tgt)
+                    else:
+                        self._nudge_island(i, away_from=cur_pos[keep])
+
+            missing = [p for p in range(num_peaks) if self.peak_owner[p] is None]
+            if missing and gen >= self.coverage_start_gen:
+                candidates = [i for i in range(self.num_islands) if self.island_owner[i] is None]
+                candidates = sorted(candidates, key=lambda i: fitness_list[i])
+
+                for pk in missing:
+                    if not candidates:
+                        break
+                    i = candidates.pop(0)
+                    if self.peak_goals[i] is not None:
+                        continue
+
+                    if self.func_id == "F2":
+                        self._initialise_island_to_peak(i, pk)
+                        self.peak_owner[pk] = i
+                        self.island_owner[i] = pk
+                        self.peak_goals[i] = None
+                    else:
+                        self.peak_goals[i] = pk
+                        self._nudge_toward_peak(i, pk)
+
         elif self.mode == 'proportional':
-            # Proportional occupancy: compute weights and desired counts
             M = self.num_islands
             C = len(niches)
-            # Compute w_c = max(f_c, 0)
             reps_fitness = [fitness_list[rep] for rep in representatives]
-            # Handle negative fitness values: if all <= 0, assign equal weights
             max_pos = [max(f, 0.0) for f in reps_fitness]
             if sum(max_pos) > 0:
                 weights = [f / sum(max_pos) for f in max_pos]
             else:
-                # Equal weights
                 weights = [1.0 / C] * C
-            # Desired counts
             desired_counts = [int(round(w * M)) for w in weights]
-            # Adjust to ensure sum equals M
             diff = M - sum(desired_counts)
-            # If diff > 0, add 1 to some niches; if diff < 0, subtract 1
             i = 0
             while diff != 0 and C > 0:
                 idx = i % C
                 if diff > 0:
                     desired_counts[idx] += 1
                     diff -= 1
-                else:  # diff < 0
+                else:
                     if desired_counts[idx] > 0:
                         desired_counts[idx] -= 1
                         diff += 1
                 i += 1
-            # Now redistribute islands according to desired_counts
-            # Build a list of islands that are currently free (to be reassigned)
             free_islands: List[int] = []
-            # For each niche, handle excess and deficit
             for niche_idx, members in enumerate(niches):
                 current = len(members)
                 target = desired_counts[niche_idx]
                 if current > target:
-                    # Excess: randomly select which members (excluding rep) to free
-                    # Determine representative index within this niche
                     rep = representatives[niche_idx]
-                    # Candidates for removal: all except rep
                     candidates = [idx for idx in members if idx != rep]
                     self.rng.shuffle(candidates)
                     to_remove = candidates[: (current - target)]
                     for idx in to_remove:
-                        # Reinitialise these islands and add to free pool
-                        self._reinitialize_island(idx)
+                        self._nudge_island(idx, away_from=decoded_list[rep])
                         free_islands.append(idx)
-                        # Remove idx from members
                         members.remove(idx)
                 elif current < target:
-                    # Deficit: need to fill up to target
                     needed = target - current
                     for _ in range(needed):
                         if free_islands:
                             idx = free_islands.pop()
                         else:
-                            # If no free island, randomly choose one that is not rep
                             candidates = [j for j in range(self.num_islands)
                                           if j not in representatives]
                             if not candidates:
-                                # Nothing to reassign; break
                                 break
                             idx = self.rng.choice(candidates)
-                        # Clone representative's p into idx
                         rep = representatives[niche_idx]
                         self._clone_island(idx, rep)
                         members.append(idx)
-            # Any remaining free islands remain reinitialised (uniform) and will
-            # wander until they latch onto a niche
         else:
             raise ValueError(f"Unknown niching mode: {self.mode}")
 
     def run(self) -> Dict[str, Any]:
-        """Run the niching island PBIL and return logs and final results."""
         return super().run()
-
 
 def run_island_pbil(
     func_id: str,
-    mode: str = 'none',
+    mode: str = "none",
     num_islands: int = 5,
     total_evals: int = 20000,
     num_samples: int = 50,
@@ -472,12 +845,22 @@ def run_island_pbil(
     sigma_niche: float | None = None,
     num_runs: int = 1,
     seed: int | None = None,
+    nudge: bool = True,
+    nudge_strength: float = 1.0,
+    use_mp: bool = False,
+    mp_workers: int | None = None,
 ) -> List[Dict[str, Any]]:
-    """Return a list of island‑PBIL run dictionaries across ``num_runs`` experiments."""
+    func_id = func_id.upper()
+
+    if sigma_niche is None:
+        sigma = 0.1 if func_id in ("F1", "F2") else 1.0
+    else:
+        sigma = float(sigma_niche)
+
     results: List[Dict[str, Any]] = []
     for i in range(num_runs):
         rng = np.random.default_rng(None if seed is None else seed + i)
-        if mode == 'none':
+        if mode == "none":
             obj = IslandPBILBase(
                 func_id=func_id,
                 num_islands=num_islands,
@@ -487,33 +870,35 @@ def run_island_pbil(
                 pmutate_prob=pmutate_prob,
                 mutation_shift=mutation_shift,
                 rng=rng,
+                use_mp=use_mp,
+                mp_workers=mp_workers,
             )
         else:
             obj = IslandPBILNiching(
                 func_id=func_id,
+                mode=mode,
                 num_islands=num_islands,
                 total_evals=total_evals,
                 num_samples=num_samples,
                 alpha=alpha,
                 pmutate_prob=pmutate_prob,
                 mutation_shift=mutation_shift,
-                mode=mode,
                 niching_interval=niching_interval,
-                sigma_niche=sigma_niche,
+                sigma_niche=sigma,
                 rng=rng,
+                nudge=nudge,
+                nudge_strength=nudge_strength,
+                use_mp=use_mp,
+                mp_workers=mp_workers,
             )
         results.append(obj.run())
     return results
 
 def prepare_run_directory(model_name: str, func_id: str) -> Path:
-    """Create and return a fresh ``run_n`` directory for an island‑PBIL experiment."""
     base = Path(f"run_{model_name}")
     base.mkdir(exist_ok=True)
-
     func_dir = base / func_id
     func_dir.mkdir(exist_ok=True)
-
-    # Determine next run number
     existing = [d for d in func_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
     if not existing:
         next_run = 1
@@ -530,15 +915,7 @@ def prepare_run_directory(model_name: str, func_id: str) -> Path:
 
     return run_dir
 
-# ---------- Helpers for aggregating island histories ----------
-
 def aggregate_best_over_islands(result_dict):
-    """
-    From a single island PBIL run, compute best-over-all-islands per generation.
-
-    result_dict['best_fitness_per_gen'] is a list of lists:
-        per_island[k][g] = fitness of best individual on island k at generation g.
-    """
     per_island = result_dict["best_fitness_per_gen"]
     if not per_island:
         return []
@@ -551,11 +928,7 @@ def aggregate_best_over_islands(result_dict):
         agg.append(best_g)
     return agg
 
-
-# ---------- Plotting ----------
-
 def island_pbil_plot_spaghetti(results, func_id: str, out_path: Path) -> None:
-    """Spaghetti of best-over-islands fitness per generation across runs."""
     plt.figure()
     for res in results:
         y = aggregate_best_over_islands(res)
@@ -571,7 +944,6 @@ def island_pbil_plot_spaghetti(results, func_id: str, out_path: Path) -> None:
 
 
 def island_pbil_plot_1d_function_with_points(results, func_id: str, out_path: Path) -> None:
-    """Plot F1/F2 and overlay final solutions from all islands across runs."""
     if func_id.upper() == "F1":
         f = bm.f1
     elif func_id.upper() == "F2":
@@ -587,7 +959,6 @@ def island_pbil_plot_1d_function_with_points(results, func_id: str, out_path: Pa
 
     finals = []
     for res in results:
-        # final_sample_decoded is a list: one decoded phenotype per island
         finals.extend(res["final_sample_decoded"])
     finals = [float(x) for x in finals]
     fvals = [f(x) for x in finals]
@@ -604,7 +975,6 @@ def island_pbil_plot_1d_function_with_points(results, func_id: str, out_path: Pa
 
 
 def island_pbil_plot_himmelblau_with_points(results, out_path: Path) -> None:
-    """Contour of Himmelblau + final solutions from all islands across runs."""
     x = np.linspace(-6, 6, 200)
     y = np.linspace(-6, 6, 200)
     X, Y = np.meshgrid(x, y)
@@ -634,16 +1004,7 @@ def island_pbil_plot_himmelblau_with_points(results, out_path: Path) -> None:
     plt.savefig(out_path)
     plt.close()
 
-
-# ---------- Saving CSV / JSON ----------
-
 def save_island_pbil_results_to_files(results, func_id: str, mode: str, num_islands: int, run_dir: Path) -> None:
-    """
-    Save per-run aggregate best fitness curves and summaries.
-
-    Note: to keep things manageable, we save only the best-over-islands curve
-    per run. If you want per-island CSVs later, we can extend this.
-    """
     for i, res in enumerate(results):
         idx = i + 1
 
@@ -671,30 +1032,19 @@ def save_island_pbil_results_to_files(results, func_id: str, mode: str, num_isla
         with json_path.open("w") as f:
             json.dump(summary, f, indent=2)
 
-# ----------------- Island PBIL peak analysis helpers -----------------
-
 def _assign_peak_1d(x: float, threshold: float = 0.1) -> int | None:
-    """
-    Assign a 1D point x in [0,1] to the nearest F1/F2 peak index,
-    or return None if it is farther than `threshold`.
-    """
     diffs = np.abs(PEAK_POS_1D - x)
     idx = int(np.argmin(diffs))
     return idx if diffs[idx] < threshold else None
 
 
 def _assign_peak_2d(x1: float, x2: float, threshold: float = 1.0) -> int | None:
-    """
-    Assign a 2D point (x1,x2) to the nearest Himmelblau minimum,
-    or return None if it is farther than `threshold`.
-    """
     point = np.array([x1, x2])
     diffs = np.linalg.norm(HIMMELBLAU_MINIMA - point, axis=1)
     idx = int(np.argmin(diffs))
     return idx if diffs[idx] < threshold else None
 
 def _island_collect_all_points(results, func_id: str):
-    """Collect all final island phenotypes across runs."""
     pts = []
     func_id = func_id.upper()
     if func_id in ("F1", "F2"):
@@ -706,9 +1056,6 @@ def _island_collect_all_points(results, func_id: str):
     return pts
 
 def island_pbil_plot_peak_representatives(results, func_id: str, out_path: Path) -> None:
-    """
-    For Island PBIL: best island per peak, aggregated across runs.
-    """
     func_id = func_id.upper()
     pts = _island_collect_all_points(results, func_id)
 
@@ -769,7 +1116,6 @@ def island_pbil_plot_peak_representatives(results, func_id: str, out_path: Path)
         plt.figure()
         cs = plt.contourf(X, Y, Z, levels=50)
         plt.colorbar(cs, label="F3 (fitness)")
-
         rep_x1 = []
         rep_x2 = []
         for k in sorted(best_per_peak):
@@ -787,9 +1133,6 @@ def island_pbil_plot_peak_representatives(results, func_id: str, out_path: Path)
         plt.close()
 
 def island_pbil_plot_peak_occupancy(results, func_id: str, out_path: Path) -> None:
-    """
-    For Island PBIL: bar plot of how many islands end on each peak (across runs).
-    """
     func_id = func_id.upper()
     pts = _island_collect_all_points(results, func_id)
 
@@ -820,9 +1163,6 @@ def island_pbil_plot_peak_occupancy(results, func_id: str, out_path: Path) -> No
     plt.close()
 
 def _island_best_run_index(results):
-    """
-    Choose best Island PBIL run by best final island fitness.
-    """
     best_idx = 0
     best_val = -np.inf
     for i, res in enumerate(results):
@@ -835,11 +1175,7 @@ def _island_best_run_index(results):
             best_idx = i
     return best_idx
 
-
 def island_pbil_plot_single_run_final(results, func_id: str, out_path: Path) -> None:
-    """
-    Plot final island solutions from the single best Island PBIL run.
-    """
     func_id = func_id.upper()
     idx = _island_best_run_index(results)
     res = results[idx]
@@ -897,19 +1233,86 @@ def island_pbil_plot_single_run_final(results, func_id: str, out_path: Path) -> 
         plt.savefig(out_path)
         plt.close()
 
+def island_pbil_plot_island_traces(results, func_id: str, out_path: Path) -> None:
+    func_id = func_id.upper()
+    best_idx = _island_best_run_index(results)
+    res = results[best_idx]
 
-# ---------- Main entry point ----------
+    if func_id in ("F1", "F2"):
+        f = bm.get_function(func_id)
+        xs = np.linspace(0.0, 1.0, 1000)
+        ys = [f(x) for x in xs]
+        fig, ax = plt.subplots()
+        ax.plot(xs, ys, label=func_id)
+
+        paths = res.get("trace_x_per_gen", res["best_x_per_gen"])
+        for k, path in enumerate(paths):
+
+            if not path:
+                continue
+            x_path = [float(x) for x in path]
+            y_path = [f(x) for x in x_path]
+
+            base_color = ax._get_lines.get_next_color()
+            rgba = mcolors.to_rgba(base_color)
+            T = len(x_path)
+            colors = [(*rgba[:3], 0.15 + 0.85 * (t / max(T - 1, 1))) for t in range(T)]
+            ax.plot(x_path, y_path, color=base_color, alpha=0.35, linewidth=1.0)
+            ax.scatter(x_path, y_path, s=18, c=colors, label=f"Island {k+1}")
+            ax.scatter([x_path[-1]], [y_path[-1]], s=70, c=[(*rgba[:3], 1.0)])
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("f(x)")
+        ax.set_title(f"{func_id}: island traces (best run #{best_idx+1})")
+        ax.grid(True, alpha=0.3)
+        if len(res["best_x_per_gen"]) <= 5:
+            ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_path)
+        plt.close(fig)
+    else:
+        x = np.linspace(-6, 6, 200)
+        y = np.linspace(-6, 6, 200)
+        X, Y = np.meshgrid(x, y)
+        Z = np.zeros_like(X)
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                Z[i, j] = bm.f3(X[i, j], Y[i, j])
+
+        fig, ax = plt.subplots()
+        cs = ax.contourf(X, Y, Z, levels=50)
+        fig.colorbar(cs, ax=ax, label="F3(x1,x2)")
+
+        paths = res.get("trace_x_per_gen", res["best_x_per_gen"])
+        for k, path in enumerate(paths):
+
+            if not path:
+                continue
+            x1_path = [float(p[0]) for p in path]
+            x2_path = [float(p[1]) for p in path]
+
+            base_color = ax._get_lines.get_next_color()
+            rgba = mcolors.to_rgba(base_color)
+            T = len(x1_path)
+            colors = [(*rgba[:3], 0.15 + 0.85 * (t / max(T - 1, 1))) for t in range(T)]
+            ax.plot(x1_path, x2_path, color=base_color, alpha=0.35, linewidth=1.0)
+            ax.scatter(x1_path, x2_path, s=18, c=colors, label=f"Island {k+1}")
+            ax.scatter([x1_path[-1]], [x2_path[-1]], s=70, c=[(*rgba[:3], 1.0)])
+
+        ax.set_xlabel("x1")
+        ax.set_ylabel("x2")
+        ax.set_title(f"F3: island traces (best run #{best_idx+1})")
+        if len(res["best_x_per_gen"]) <= 5:
+            ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_path)
+        plt.close(fig)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Island PBIL (with optional niching) on Deb & Goldberg benchmarks")
     parser.add_argument("--func", type=str, default="F1", choices=["F1", "F2", "F3"], help="Benchmark function")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="none",
-        choices=["none", "base", "proportional"],
-        help="Niching mode: 'none', 'base' (speciation), 'proportional'",
-    )
+    parser.add_argument("--mode", type=str, default="none", choices=["none", "base", "proportional", "peak_repulsion", "peak_walk"], help="Niching mode")
     parser.add_argument("--num_islands", type=int, default=5, help="Number of islands")
     parser.add_argument("--runs", type=int, default=30, help="Number of independent Island PBIL runs")
     parser.add_argument("--seed", type=int, default=None, help="Base random seed")
@@ -917,6 +1320,11 @@ def main():
     parser.add_argument("--num_samples", type=int, default=50, help="Samples per island per generation")
     parser.add_argument("--niching_interval", type=int, default=10, help="Niching interval (generations)")
     parser.add_argument("--sigma_niche", type=float, default=None, help="Niche distance threshold (optional override)")
+    parser.add_argument("--mp", action="store_true", help="Update islands in parallel using multiprocessing")
+    parser.add_argument("--mp_workers", type=int, default=None, help="Number of worker processes for --mp")
+    parser.add_argument("--no_nudge", action="store_true", help="Use random reinitialization instead of nudging")
+    parser.add_argument("--nudge_strength", type=float, default=1.0, help="Scale factor for nudge step size")
+
     args = parser.parse_args()
 
     func_id = args.func.upper()
@@ -924,17 +1332,16 @@ def main():
     mode = args.mode
     num_islands = args.num_islands
 
-    # Default sigma if not provided
     if args.sigma_niche is None:
-        if func_id in ("F1", "F2"):
-            sigma_niche = 0.1
-        else:
-            sigma_niche = 1.0
+        sigma_niche = 0.1 if func_id in ("F1", "F2") else 1.0
     else:
         sigma_niche = args.sigma_niche
 
     run_dir = prepare_run_directory("IslandPBIL", func_id)
-    print(f"[IslandPBIL] Running {num_runs} runs on {func_id} with mode='{mode}', {num_islands} islands. Output in {run_dir}")
+    print(
+        f"[IslandPBIL] Running {num_runs} runs on {func_id} "
+        f"with mode='{mode}', {num_islands} islands. Output in {run_dir}"
+    )
 
     results = run_island_pbil(
         func_id=func_id,
@@ -942,21 +1349,25 @@ def main():
         num_islands=num_islands,
         total_evals=args.total_evals,
         num_samples=args.num_samples,
-        alpha=0.1,
+        alpha=0.04,
         pmutate_prob=0.02,
         mutation_shift=0.05,
         niching_interval=args.niching_interval,
         sigma_niche=sigma_niche,
         num_runs=num_runs,
         seed=args.seed,
+        nudge=not args.no_nudge,
+        nudge_strength=args.nudge_strength,
+        use_mp=args.mp,
+        mp_workers=args.mp_workers,
     )
 
     save_island_pbil_results_to_files(results, func_id, mode, num_islands, run_dir)
-
     island_pbil_plot_spaghetti(results, func_id, run_dir / "best_fitness_spaghetti.png")
     island_pbil_plot_peak_representatives(results, func_id, run_dir / "island_peak_representatives.png")
     island_pbil_plot_peak_occupancy(results, func_id, run_dir / "island_peak_occupancy.png")
     island_pbil_plot_single_run_final(results, func_id, run_dir / "island_best_run_final_points.png")
+    island_pbil_plot_island_traces(results, func_id, run_dir / "island_traces.png")
 
     if func_id in ("F1", "F2"):
         island_pbil_plot_1d_function_with_points(results, func_id, run_dir / f"{func_id.lower()}_final_points.png")
@@ -968,4 +1379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
