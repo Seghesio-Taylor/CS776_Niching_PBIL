@@ -1,3 +1,13 @@
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/12e78228-7b02-4d1e-a115-cba22114cee3"
+    width="640"
+    height="480"
+    alt="image"
+  />
+</p>
+
+
 This repository contains the full experimental framework for the CS 776 Final Project, exploring **niching, speciation, and peak coverage** in evolutionary algorithms. Three algorithm families are implemented and evaluated across standard multimodal benchmarks (F1, F2, F3):
 
 - Genetic Algorithm (GA)
