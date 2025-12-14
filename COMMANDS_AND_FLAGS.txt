@@ -1,0 +1,165 @@
+COMMANDS_AND_FLAGS.txt
+Updated: 2025-12-13
+
+This file documents how to run the three experiment drivers in this repo:
+  - GA.py
+  - vanilla_pbil.py
+  - pbil_island.py
+
+All scripts are run with python3 and accept --func {F1,F2,F3}.
+They auto-create output folders like:
+  run_GA/F2/run_<N>/
+  run_PBIL/F2/run_<N>/
+  run_IslandPBIL/F2/run_<N>/
+
+
+============================================================
+1) GA.py
+============================================================
+
+Basic (30 runs each function):
+  python3 GA.py --func F1 --runs 30
+  python3 GA.py --func F2 --runs 30
+  python3 GA.py --func F3 --runs 30
+
+Common sweeps:
+  python3 GA.py --func F2 --runs 30 --seed 1
+  python3 GA.py --func F2 --runs 30 --sigma_mating 0.10
+
+Flags (from argparse):
+  --func {F1,F2,F3}
+      Benchmark function. Default: F1
+
+  --runs INT
+      Number of independent runs. Default: 30
+
+  --seed INT
+      Base RNG seed. If provided, run i uses seed+i. Default: None
+
+  --sigma_mating FLOAT
+      (GA niching / mating radius) sigma used by the GA mating restriction
+      logic (if enabled in your GA implementation). Default: None
+
+
+============================================================
+2) vanilla_pbil.py
+============================================================
+
+Basic (30 runs each function):
+  python3 vanilla_pbil.py --func F1 --runs 30
+  python3 vanilla_pbil.py --func F2 --runs 30
+  python3 vanilla_pbil.py --func F3 --runs 30
+
+Common sweeps:
+  python3 vanilla_pbil.py --func F2 --runs 30 --seed 1
+  python3 vanilla_pbil.py --func F2 --runs 30 --total_evals 60000 --num_samples 50
+
+Flags (from argparse):
+  --func {F1,F2,F3}
+      Benchmark function. Default: F1
+
+  --runs INT
+      Number of independent runs. Default: 30
+
+  --seed INT
+      Base RNG seed. If provided, run i uses seed+i. Default: None
+
+  --total_evals INT
+      Total fitness evaluations per run. Default: 20000
+
+  --num_samples INT
+      Samples per generation (population sampled from probability vector).
+      Default: 50
+
+
+============================================================
+3) pbil_island.py
+============================================================
+
+Modes:
+  none            : independent islands, no niching / coordination
+  base            : simple speciation (phenotypic distance clustering)
+  proportional    : allocates islands proportionally to niche fitness
+  peak_repulsion  : peak-aware (assign islands to known peaks; repel duplicates)
+  peak_walk       : “coverage walk” to distribute islands across known peaks
+
+Baseline examples:
+  python3 pbil_island.py --func F2 --mode none --num_islands 5 --runs 30
+  python3 pbil_island.py --func F3 --mode base --num_islands 4 --runs 30
+
+Peak-aware examples (higher eval budget recommended):
+  python3 pbil_island.py --func F2 --mode peak_repulsion --num_islands 5 --runs 30 --total_evals 60000 --niching_interval 5 --sigma_niche 0.10
+  python3 pbil_island.py --func F2 --mode peak_walk      --num_islands 5 --runs 30 --total_evals 60000 --num_samples 50 --seed 1
+
+Parallel update example (if you want it):
+  python3 pbil_island.py --func F2 --mode base --num_islands 5 --runs 30 --mp --mp_workers 8
+
+Nudge controls:
+  - Default behavior is “nudging on”
+  - To turn nudging OFF (use random reinitialization instead):
+      python3 pbil_island.py --func F2 --mode base --num_islands 5 --runs 30 --no_nudge
+  - To scale nudge strength:
+      python3 pbil_island.py --func F2 --mode base --num_islands 5 --runs 30 --nudge_strength 0.60
+
+
+Flags (from argparse):
+  --func {F1,F2,F3}
+      Benchmark function. Default: F1
+
+  --mode {none,base,proportional,peak_repulsion,peak_walk}
+      Island coordination / niching mode. Default: none
+
+  --num_islands INT
+      Number of islands (probability vectors). Default: 5
+
+  --runs INT
+      Number of independent Island-PBIL runs. Default: 30
+
+  --seed INT
+      Base RNG seed. If provided, run i uses seed+i. Default: None
+
+  --total_evals INT
+      Total fitness evaluations per run (shared across islands). Default: 20000
+
+  --num_samples INT
+      Samples per island per generation. Default: 50
+
+  --niching_interval INT
+      How often (in generations) to run niching/coordination logic.
+      Default: 10
+
+  --sigma_niche FLOAT
+      Phenotypic distance threshold for clustering / “same niche” decisions.
+      Default (if omitted):
+        - F1/F2: 0.1
+        - F3:    1.0
+
+  --mp
+      Update islands in parallel using multiprocessing. Default: off
+
+  --mp_workers INT
+      Worker process count for --mp. Default: None (mp decides)
+
+  --no_nudge
+      Disable nudging and use random reinitialization when re-seeding islands.
+
+  --nudge_strength FLOAT
+      Scales how aggressively nudges move islands when breaking collisions or
+      pushing toward goals. Default: 1.0
+
+
+============================================================
+4) Convenience runners
+============================================================
+
+Full sweep runner (your “big hammer”):
+  bash run_all.sh
+
+If you have a separate full-coverage script (example):
+  bash run_all_full_coverage.sh
+
+Tip:
+  Use -h on each script to see the canonical flag list:
+    python3 GA.py -h
+    python3 vanilla_pbil.py -h
+    python3 pbil_island.py -h
