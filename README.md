@@ -1,125 +1,229 @@
-# CS776_Niching_PBIL
-CS 776 Final Research Project. Niching and Speciation in Parallel Population-Based Incremental Learning
+This repository contains the full experimental framework for the CS 776 Final Project, exploring **niching, speciation, and peak coverage** in evolutionary algorithms. Three algorithm families are implemented and evaluated across standard multimodal benchmarks (F1, F2, F3):
 
-CS 776 Final Project — Command Reference
-======================================
+- Genetic Algorithm (GA)
+- Vanilla Population-Based Incremental Learning (PBIL)
+- Island-based PBIL with multiple coordination modes
 
-This text file summarizes the command-line interfaces for the three
-evolutionary algorithms provided in this project: **Genetic Algorithm (GA)**,
-**vanilla Population-Based Incremental Learning (PBIL)**, and **Island PBIL**.
-It lists available flags, their default values, and the overall behavior of
-each program. These descriptions mirror the argument parsers implemented in
-the Python scripts.
+All scripts are designed for **reproducible, large-scale experimental sweeps**, and results are written to a standardized directory structure for analysis and reporting.
 
--------------------------------------------------------------------------------
-1. Genetic Algorithm (`GA.py`)
--------------------------------------------------------------------------------
+---
 
-**Command Syntax**
+## Command Reference Overview
 
-    python GA.py --func <F1|F2|F3> --runs <int> [--seed <int>]
+This document summarizes the **command-line interfaces**, **available flags**, and **algorithmic behavior** for each executable script. The descriptions directly reflect the argument parsers and logic implemented in the current codebase.
 
-**Flags**
+Scripts covered:
+- `GA.py`
+- `vanilla_pbil.py`
+- `pbil_island.py`
 
-| Flag       | Default | Description                                               |
-|------------|---------|-----------------------------------------------------------|
-| `--func`   | `F1`    | Selects the benchmark function. Must be one of `F1`, `F2`, or `F3`. |
-| `--runs`   | `30`    | Number of independent GA runs. Each run produces its own set of outputs. |
-| `--seed`   | `None`  | Base random number seed. If provided, run *i* uses seed + i.            |
+---
 
-**Behavior**
+# Genetic Algorithm (GA.py)
 
-- Population size: 100 individuals with 30‐bit chromosomes.
-- Generations: 200 (20,000 total fitness evaluations per run).
-- Operators: one-point crossover (probability 0.9) and bit-flip mutation (0.001 per bit).
-- Selection: tournament selection (size 2).
-- Niching: phenotypic restricted mating plus restricted tournament replacement (RTR).
-- Elitism: the best individual is preserved each generation.
+## Command Syntax
 
-Each invocation writes results into a directory structure `run_GA/<FUNC>/run_N/`.
+```
+python GA.py --func <F1|F2|F3> --runs <int> [--seed <int>]
+```
 
--------------------------------------------------------------------------------
-2. Vanilla PBIL (`vanilla_pbil.py`)
--------------------------------------------------------------------------------
+## Flags
 
-**Command Syntax**
+| Flag | Default | Description |
+|-----|--------|-------------|
+| `--func` | F1 | Benchmark function: F1, F2, or F3 |
+| `--runs` | 30 | Number of independent GA runs |
+| `--seed` | None | Base RNG seed; run *i* uses `seed + i` |
 
-    python vanilla_pbil.py --func <F1|F2|F3> --runs <int> \
-                          [--seed <int>] [--total_evals <int>] [--num_samples <int>]
+## Behavior
 
-**Flags**
+- Population size: **100 individuals**, each encoded as a 30-bit chromosome
+- Fitness evaluations per run: **20,000** (200 generations)
+- Selection: tournament selection (size = 2)
+- Variation operators:
+  - One-point crossover (probability 0.9)
+  - Bit-flip mutation (0.001 per bit)
+- Elitism: best individual preserved each generation
+- Niching: **phenotypic restricted mating** and **restricted tournament replacement (RTR)**
 
-| Flag             | Default | Description                                                                    |
-|------------------|---------|--------------------------------------------------------------------------------|
-| `--func`         | `F1`    | Benchmark to optimize. One of `F1`, `F2`, or `F3`.                            |
-| `--runs`         | `30`    | Number of independent PBIL runs.                                              |
-| `--seed`         | `None`  | Base seed; run *i* uses seed + i if provided.                                 |
-| `--total_evals`  | `20000` | Total fitness evaluations allowed per run.                                    |
-| `--num_samples`  | `50`    | Number of individuals sampled from the probability vector each generation.    |
+Each invocation writes results to:
 
-**Behavior**
+```
+run_GA/<FUNC>/run_N/
+```
 
-- Maintains a single probability vector `p` (length 30). Each bit is initialized to 0.5.
-- Samples `num_samples` candidate solutions every generation.
-- Updates `p` toward the best sampled individual using a learning rate (α=0.1).
-- Occasional mutation perturbs entries of `p` toward 0.5.
-- Runs until `total_evals` evaluations are consumed. Number of generations = `total_evals / num_samples`.
+including convergence plots, final solution distributions, and summary statistics.
 
-Outputs are written to `run_PBIL/<FUNC>/run_N/` with statistics and plots of convergence, final solutions, and peak occupancy.
+---
 
--------------------------------------------------------------------------------
-3. Island PBIL (`pbil_island.py`)
--------------------------------------------------------------------------------
+# Vanilla PBIL (vanilla_pbil.py)
 
-**Command Syntax**
+## Command Syntax
 
-    python pbil_island.py --func <F1|F2|F3> --mode <none|base|proportional> \
-                          --num_islands <int> --runs <int> \
-                          [--seed <int>] [--total_evals <int>] \
-                          [--num_samples <int>] [--niching_interval <int>] \
-                          [--sigma_niche <float>]
+```
+python vanilla_pbil.py --func <F1|F2|F3> --runs <int> \
+                       [--seed <int>] [--total_evals <int>] [--num_samples <int>]
+```
 
-**Flags**
+## Flags
 
-| Flag               | Default       | Description                                                                                                 |
-|--------------------|---------------|-------------------------------------------------------------------------------------------------------------|
-| `--func`           | `F1`          | Benchmark function. One of `F1`, `F2`, or `F3`.                                                             |
-| `--mode`           | `none`        | Niching mode: `none` (independent islands), `base` (speciation), or `proportional` (peak-height reallocation). |
-| `--num_islands`    | `5`           | Number of PBIL islands running in parallel.                                                                 |
-| `--runs`           | `30`          | Number of independent island PBIL runs.                                                                     |
-| `--seed`           | `None`        | Base random seed; run *i* uses seed + i if provided.                                                       |
-| `--total_evals`    | `20000`       | Total evaluations per run; evaluations are divided among islands.                                           |
-| `--num_samples`    | `50`          | Samples per island per generation.                                                                          |
-| `--niching_interval` | `10`        | Apply the niching reallocation step every `niching_interval` generations (only for `base` or `proportional` modes). |
-| `--sigma_niche`    | See below     | Distance threshold for niche detection. Defaults to 0.1 for F1/F2 and 1.0 for F3 if not provided.            |
+| Flag | Default | Description |
+|-----|--------|-------------|
+| `--func` | F1 | Benchmark function |
+| `--runs` | 30 | Number of independent PBIL runs |
+| `--seed` | None | Base RNG seed; run *i* uses `seed + i` |
+| `--total_evals` | 20000 | Total fitness evaluations per run |
+| `--num_samples` | 50 | Samples drawn per generation |
 
-**Behavior**
+## Behavior
 
-- Islands maintain separate probability vectors and sample populations independently.  When more than one island is used the per‑generation updates are executed in parallel using separate processes via the ``multiprocessing`` module with the ``fork`` start method.
-- **Mode `none`**: islands never coordinate; this is equivalent to `num_islands` independent PBIL runs, now executed concurrently.
-- **Mode `base`** (speciation): appropriate when the number of islands matches the number of peaks.  At each niching interval the algorithm groups islands by phenotype; each niche retains its best island and resets any additional members to explore other regions.
-- **Mode `proportional`** (peak‑height allocation): suited to a large number of islands.  After each niching interval, islands are assigned to niches in proportion to niche fitness by cloning representatives or resetting islands until the desired distribution is reached.
-- Niching modes use `--niching_interval` to control how often niche detection occurs, and `--sigma_niche` to define the phenotypic distance threshold.
+- Maintains a **single probability vector** `p ∈ [0,1]^30`, initialized near 0.5
+- Each generation:
+  - Samples `num_samples` bitstrings
+  - Evaluates fitness
+  - Updates `p` toward the best individual (learning rate α = 0.1)
+  - Applies probabilistic mutation toward 0.5
+- Number of generations = `total_evals / num_samples`
 
-Results are stored in `run_IslandPBIL/<FUNC>/run_N/` directories, including aggregated fitness curves, final island solutions, peak occupancy histograms, and representative solutions per peak.
+Results are written to:
 
--------------------------------------------------------------------------------
-4. Folder Structure
--------------------------------------------------------------------------------
+```
+run_PBIL/<FUNC>/run_N/
+```
 
-All algorithms write their outputs into a nested directory hierarchy:
+including convergence curves, final solution plots, and peak occupancy statistics.
 
-    run_<MODEL>/<FUNCTION>/run_#/...
+---
 
-where `<MODEL>` is one of `GA`, `PBIL`, or `IslandPBIL`; `<FUNCTION>` is the benchmark ID (`F1`, `F2`, or `F3`); and `run_#` is an incrementing index for each invocation. Within each `run_#` directory you will find CSV files, JSON summaries, and PNG plots summarizing the run’s performance.
+# Island PBIL (pbil_island.py)
 
--------------------------------------------------------------------------------
-5. Helpful Scripts
--------------------------------------------------------------------------------
+Island PBIL runs **multiple PBIL instances (islands)** in parallel, with optional coordination mechanisms designed to promote multimodal coverage.
 
-- `Makefile` provides one-line commands such as `make ga_f2` or `make islands_prop_f2` to run standard experiments.
-- `run_all.sh` executes a full sweep across all functions, modes, and island configurations for comprehensive results. Run it with:
+## Command Syntax
 
-      bash run_all.sh
+```
+python pbil_island.py --func <F1|F2|F3> --mode <none|base|proportional|peak_repulsion|peak_walk> \
+                      --num_islands <int> --runs <int> \
+                      [--seed <int>] [--total_evals <int>] [--num_samples <int>] \
+                      [--niching_interval <int>] [--sigma_niche <float>] \
+                      [--nudge_strength <float>] [--no_nudge]
+```
 
--------------------------------------------------------------------------------
+## Flags
+
+| Flag | Default | Description |
+|-----|--------|-------------|
+| `--func` | F1 | Benchmark function |
+| `--mode` | none | Island coordination mode |
+| `--num_islands` | 5 | Number of PBIL islands |
+| `--runs` | 30 | Independent runs |
+| `--seed` | None | Base RNG seed |
+| `--total_evals` | 20000 | Total evaluations per run (shared across islands) |
+| `--num_samples` | 50 | Samples per island per generation |
+| `--niching_interval` | 10 | Interval for niching logic (when applicable) |
+| `--sigma_niche` | F1/F2: 0.1, F3: 1.0 | Phenotypic distance threshold |
+| `--nudge_strength` | 1.0 | Step size scaling for nudging |
+| `--no_nudge` | off | Disable nudging (use random reinitialization) |
+
+---
+
+## Island PBIL Modes
+
+### Mode: `none`
+
+- Islands are completely independent
+- Equivalent to running multiple PBIL instances concurrently
+- No information sharing or coordination
+
+---
+
+### Mode: `base` (Speciation)
+
+- Designed for cases where **number of islands ≈ number of peaks**
+- Periodically clusters islands by phenotype
+- Within each niche:
+  - Best island is retained
+  - Extra islands are nudged or reinitialized to explore elsewhere
+
+---
+
+### Mode: `proportional`
+
+- Designed for **large island counts** (e.g., 50–100)
+- Niche occupancy is proportional to niche fitness
+- Stronger peaks attract more islands via cloning
+- Weaker peaks retain fewer representatives
+
+---
+
+### Mode: `peak_repulsion`
+
+- Uses **known peak locations** (Deb–Goldberg for F1/F2, Himmelblau minima for F3)
+- Ensures at most one island occupies each peak
+- Colliding islands are actively repelled and reassigned
+- Guarantees peak coverage when enough islands exist
+
+---
+
+### Mode: `peak_walk`
+
+- Explicit **goal-directed peak coverage** with continuous trajectories
+- Each island:
+  - Starts from a random initialization
+  - Is assigned a target peak
+  - Gradually *walks* through the search space via probabilistic nudging
+- PBIL learning is temporarily suppressed during long-distance travel to prevent basin capture
+- Once an island reaches a peak, it claims ownership and remains tethered
+- Collision handling dynamically reroutes islands to uncovered peaks
+
+This mode produces the characteristic **smooth island trace plots**, showing islands traversing plains before ascending peaks.
+
+---
+
+## Outputs
+
+All Island PBIL runs write to:
+
+```
+run_IslandPBIL/<FUNC>/run_N/
+```
+
+Artifacts include:
+- Best-fitness spaghetti plots
+- Final island solutions
+- Peak occupancy histograms
+- Representative solutions per peak
+- Island trajectory plots (`island_traces.png`)
+
+---
+
+## Folder Structure
+
+```
+run_<MODEL>/<FUNCTION>/run_#/
+```
+
+Where:
+- `<MODEL>` ∈ {GA, PBIL, IslandPBIL}
+- `<FUNCTION>` ∈ {F1, F2, F3}
+- `run_#` increments automatically
+
+Each directory contains CSV logs, JSON summaries, and PNG figures suitable for direct inclusion in the final report.
+
+---
+
+## Helper Scripts
+
+- `run_all.sh` / `run_all_full_coverage.sh`
+  - Executes comprehensive experimental sweeps across all algorithms, modes, and parameter settings
+
+Run with:
+
+```
+bash run_all.sh
+```
+
+---
+
+This framework is designed to support **reproducible multimodal optimization research**, with a clear separation between algorithm logic, experimental control, and result analysis.
+
